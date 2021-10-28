@@ -1,16 +1,19 @@
 #include <map>
 #include <string>
+#include <filesystem>
 
 #include <pcap.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <openssl/aes.h>
 #include <netinet/ip_icmp.h>
 #include <netinet/if_ether.h>
 
 const char PROTOCOL_HASH[6] = "ISA_3";
 
+// Header of secret protocol
 struct secret_header
 {
     struct icmphdr icmphdr;
@@ -25,9 +28,10 @@ struct secret_header
     int transfer_id;
 };
 
-// Maximum size of secret_file_packet can be 150 bytes
-const size_t MAX_FILENAME_LENGTH = 150 - sizeof(secret_header) - sizeof(int);
+// Maximum size of secret_file_packet can be 1000 bytes
+const size_t MAX_FILENAME_LENGTH = 1000 - sizeof(secret_header) - sizeof(int);
 
+// Packet that is sent on new file transfer
 struct secret_file_packet
 {
     // SECRET header
@@ -40,11 +44,13 @@ struct secret_file_packet
     char transfer_name[MAX_FILENAME_LENGTH];
 };
 
-// Maximum size of secret_data_packet can be 150 bytes
-const size_t MAX_TRANSFER_DATA = ((150 - sizeof(secret_header)) / AES_BLOCK_SIZE) * 16;
+// Maximum size of secret_data_packet can be 1000 bytes
+const size_t MAX_TRANSFER_DATA = ((1000 - sizeof(secret_header)) / AES_BLOCK_SIZE) * 16;
 
+// Maximum number of AES blocks that fit the ethernet packet
 const size_t MAX_AES_BLOCKS = MAX_TRANSFER_DATA / AES_BLOCK_SIZE;
 
+// Packet that contains transfer data
 struct secret_data_packet
 {
     // SECRET header
@@ -54,7 +60,11 @@ struct secret_data_packet
     unsigned char transfer_data[MAX_TRANSFER_DATA];
 };
 
-// Calculating the Check Sum
+// How many seconds to wait before termination
+const int INACTIVITY_TIMEOUT = 5;
+
+// Calculate ICMP checksum
+// Function was taken from https://www.geeksforgeeks.org/ping-in-c/
 unsigned short checksum(void *b, int len)
 {    
 	unsigned short *buf = (unsigned short *) b;
@@ -78,13 +88,16 @@ static const unsigned char aes_key[] = {
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
 
-int send_data(int socket, unsigned char *data, int transfer_id, sockaddr_in address)
+// Sent packets counter
+auto sequence = 0;
+
+int send_data(int socket, unsigned char *data, int transfer_id, addrinfo *address)
 {
     struct secret_data_packet data_packet;
-    bzero(&data_packet, sizeof(data_packet));
+    memset(&data_packet, 0, sizeof(data_packet));
     data_packet.header.icmphdr.type = ICMP_ECHO;
     data_packet.header.icmphdr.un.echo.id = rand();
-    data_packet.header.icmphdr.un.echo.sequence = rand();
+    data_packet.header.icmphdr.un.echo.sequence = sequence++;
 
     strcpy(data_packet.header.protocol_hash, PROTOCOL_HASH);
     data_packet.header.protocol_type = 2;
@@ -95,7 +108,7 @@ int send_data(int socket, unsigned char *data, int transfer_id, sockaddr_in addr
 
     data_packet.header.icmphdr.checksum = checksum(&data_packet, sizeof(data_packet));
 
-    auto sent = sendto(socket, &data_packet, sizeof(data_packet), 0, (struct sockaddr*) &address, sizeof(address));
+    auto sent = sendto(socket, &data_packet, sizeof(data_packet), 0, address->ai_addr, address->ai_addrlen);
 
     if(sent < 0)
         return 0;
@@ -110,40 +123,58 @@ int send_data(int socket, unsigned char *data, int transfer_id, sockaddr_in addr
     return 1;
 }
 
-int client(in_addr_t address, char *filename)
+int client(addrinfo *address, char *filename)
 {
-    struct sockaddr_in servaddr;
-	servaddr.sin_family = AF_INET;
-	servaddr.sin_addr.s_addr = address;
-    servaddr.sin_port = 0;
-	memset(&servaddr.sin_zero, 0, sizeof (servaddr.sin_zero));
+    // Initialize either IPv4 or IPv6 socket
+    int sockfd;
+    if(address->ai_family == AF_INET)
+        sockfd = socket(address->ai_family, address->ai_socktype, IPPROTO_ICMP);
+    else
+        sockfd = socket(address->ai_family, address->ai_socktype, IPPROTO_ICMPV6);
 
-    auto sockfd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if(sockfd == -1)
+    {
+        fprintf(stderr, "Failed to create socket\n");
+        return 1;
+    }
 
-    int ttl_val = 10;
+    // Set timeout options
     struct timeval tv_out;
-    tv_out.tv_sec = 1;
+    tv_out.tv_sec = INACTIVITY_TIMEOUT;
     tv_out.tv_usec = 0;
 
-    setsockopt(sockfd, SOL_IP, IP_TTL, &ttl_val, sizeof(ttl_val));
-    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv_out, sizeof(tv_out));
+    auto optresult = setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*) &tv_out, sizeof(tv_out));
+
+    if(optresult == -1)
+    {
+        fprintf(stderr, "Failed to set socket options\n");
+        return 1;
+    }
+
+    FILE *file = fopen(filename, "rb");
+
+    if(file == NULL)
+    {
+        fprintf(stderr, "Failed to open target file\n");
+        return 1;
+    }
 
     // Calculate file length
-    FILE *file = fopen(filename, "rb");
     fseek(file, 0L, SEEK_END);
     auto size = ftell(file);
     fseek(file, 0L, SEEK_SET);
 
+    // Generate transfer id
+    auto transferId = rand();
+
     struct secret_file_packet file_packet;
-    bzero(&file_packet, sizeof(file_packet));
+    memset(&file_packet, 0, sizeof(file_packet));
     file_packet.header.icmphdr.type = ICMP_ECHO;
     file_packet.header.icmphdr.un.echo.id = rand();
-    file_packet.header.icmphdr.un.echo.sequence = rand();
-
-    auto id = rand();
+    file_packet.header.icmphdr.un.echo.sequence = sequence++;
     
     strcpy(file_packet.header.protocol_hash, PROTOCOL_HASH);
-    file_packet.header.transfer_id = id;
+    file_packet.header.transfer_id = transferId;
     file_packet.header.protocol_type = 1;
 
     file_packet.transfer_size = size;
@@ -153,13 +184,13 @@ int client(in_addr_t address, char *filename)
 
     file_packet.header.icmphdr.checksum = checksum(&file_packet, sizeof(file_packet));
 
-    printf("Sending file to the server...\n");
+    fprintf(stdout, "Sending file to the server... (Tranfer ID: %d)\n", transferId);
 
-    auto sent = sendto(sockfd, &file_packet, sizeof(file_packet), 0, (struct sockaddr*) &servaddr, sizeof(servaddr));
+    auto sent = sendto(sockfd, &file_packet, sizeof(file_packet), 0, address->ai_addr, address->ai_addrlen);
 
     if(sent < 0)
     {
-        printf("Could not contact server\n");
+        fprintf(stdout, "Could not contact the server\n");
         fclose(file);
         return 1;
     }
@@ -170,22 +201,29 @@ int client(in_addr_t address, char *filename)
 
     if(received < 0)
     {
-        printf("File packet sent but reply not received\n");
+        fprintf(stdout, "File packet sent but reply not received\n");
         fclose(file);
         return 1;
     }
 
-    int bytes_read, bytes_written;
-
+    // How many blocks of 16 bytes were parsed already
     int parsed_blocks = 0;
 
+    // Currently parsed packet buffer
     unsigned char packetData[MAX_TRANSFER_DATA] = {0};
 
+    // Curently parsed block buffer
     unsigned char block[AES_BLOCK_SIZE] = {0};
 
-    while (true) {
-        bytes_read = fread(block, 1, AES_BLOCK_SIZE, file);
+    long size_sent = 0;
 
+    while (true) {
+        auto bytes_read = fread(block, 1, AES_BLOCK_SIZE, file);
+
+        fprintf(stdout, "\rProgress: %ld/%ld bytes sent", size_sent += bytes_read, size);
+        fflush(stdout);
+
+        // Encrypt block of data
         AES_KEY key;
         AES_set_encrypt_key(aes_key, 128, &key);
         AES_encrypt(block, &packetData[parsed_blocks * AES_BLOCK_SIZE], &key);
@@ -193,9 +231,9 @@ int client(in_addr_t address, char *filename)
         
         if(bytes_read < AES_BLOCK_SIZE)
         {
-            if(!send_data(sockfd, packetData, id, servaddr))
+            if(!send_data(sockfd, packetData, transferId, address))
             {
-                printf("Failed to send block of data, exiting\n");
+                fprintf(stdout, "\nFailed to send block of data, exiting\n");
                 fclose(file);
                 return 1;
             }
@@ -204,18 +242,20 @@ int client(in_addr_t address, char *filename)
 
         if(parsed_blocks == MAX_AES_BLOCKS)
         {
-            if(!send_data(sockfd, packetData, id, servaddr))
+            if(!send_data(sockfd, packetData, transferId, address))
             {
-                printf("Failed to send block of data, exiting\n");
+                fprintf(stdout, "\nFailed to send block of data, exiting\n");
                 fclose(file);
                 return 1;
             }
             memset(packetData, 0, MAX_TRANSFER_DATA);
             parsed_blocks = 0;
         }
+
+        memset(block, 0, AES_BLOCK_SIZE);
     }
 
-    printf("File was sent (total size: %d bytes)\n", size);
+    fprintf(stdout, "\nFile was sent (total size: %ld bytes)\n", size);
 
     fclose(file);
     return 0;
@@ -227,42 +267,71 @@ struct transfer_info
 
     int transfered;
 
+    int lastUpdate;
+
     FILE *file;
 };
 
 std::map<int, transfer_info*> transfers;
 
-void packet_received(u_char *useless,const struct pcap_pkthdr* pkthdr,const u_char* packet)
+void packet_received(u_char *args, const struct pcap_pkthdr* header, const u_char* packet)
 {
-    auto ethernetHeader = (struct ether_header*) packet;
-    if (ntohs(ethernetHeader->ether_type) != ETHERTYPE_IP)
-        return;
+    auto currentTime = time(NULL);
     
-    auto ipHeader = (struct ip*)(packet + sizeof(struct ether_header));
+    // Remove inactive transfers from memory
+    for (auto it = transfers.cbegin(), next_it = it; it != transfers.cend(); it = next_it)
+    {
+        ++next_it;
+        auto info = it->second;
+        if(info->lastUpdate + INACTIVITY_TIMEOUT < currentTime)
+        {
+            fprintf(stderr, "(TID: %d) Transfer terminated because of inactivity (received %d/%d bytes)\n", it->first, info->transfered, info->transfer_size);
+            fclose(info->file);
+            delete info;
+            transfers.erase(it);
+        }
+    }
+
+    auto ipHeader = (struct ip*) (packet + 16);
 
     if (ipHeader->ip_p != IPPROTO_ICMP)
         return;
 
-    auto secretHeader = (struct secret_header*) (packet + sizeof(struct ether_header) + sizeof(struct ip));
+    auto secretHeader = (struct secret_header*) (packet + 16 + sizeof(struct ip));
 
+    // Compare protocol hash so we can filter out other ICMP messages not relevant to our app
     if(strcmp(secretHeader->protocol_hash, PROTOCOL_HASH))
         return;
 
+    // Request for new file transfer
     if(secretHeader->protocol_type == 1)
     {
-        auto fileHeader = (struct secret_file_packet*) (packet + sizeof(struct ether_header) + sizeof(struct ip));
+        auto fileHeader = (struct secret_file_packet*) (packet + 16 + sizeof(struct ip));
+
+        auto filename = basename(fileHeader->transfer_name);
+        auto file = fopen(filename, "wb+");
+
+        if(file == NULL)
+        {
+            fprintf(stderr, "(TID: %d) Could not open file with name: %s", secretHeader->transfer_id, fileHeader->transfer_name);
+            return;
+        }
 
         auto info = new transfer_info();
-        info->file = fopen(std::to_string(secretHeader->transfer_id).c_str(), "wb");
+        info->lastUpdate = currentTime;
         info->transfer_size = fileHeader->transfer_size;
+        info->file = file;
+
         transfers[secretHeader->transfer_id] = info;
 
-        printf("(TID: %d) Started receiving file: %s, size: %d bytes\n", secretHeader->transfer_id, fileHeader->transfer_name, fileHeader->transfer_size);
+        printf("(TID: %d) Started receiving file: %s, size: %d bytes\n", secretHeader->transfer_id, filename, fileHeader->transfer_size);
     }
+    // Data for open file transfer
     else if(secretHeader->protocol_type == 2)
     {
-        auto dataHeader = (struct secret_data_packet*) (packet + sizeof(struct ether_header) + sizeof(struct ip));
+        auto dataHeader = (struct secret_data_packet*) (packet + 16 + sizeof(struct ip));
 
+        // if specified transfer_id does not exist
         if(transfers.find(secretHeader->transfer_id) == transfers.end())
             return;
 
@@ -284,11 +353,13 @@ void packet_received(u_char *useless,const struct pcap_pkthdr* pkthdr,const u_ch
                 fclose(transfer->file);
                 delete transfer;
                 transfers.erase(secretHeader->transfer_id);
+                return;
             } else {
                 fwrite(block, 1, sizeof(block), transfer->file);
             }
 
             transfer->transfered += AES_BLOCK_SIZE;
+            transfer->lastUpdate = currentTime;
             parsed_blocks++;
         }
     }
@@ -299,16 +370,35 @@ int server()
     char error[PCAP_ERRBUF_SIZE];
 
     pcap_if_t *interfaces;
-    pcap_findalldevs(&interfaces, error);
-    auto device = pcap_open_live(interfaces[0].name, BUFSIZ, 0, -1, error);
+    if(pcap_findalldevs(&interfaces, error) == PCAP_ERROR)
+    {
+        fprintf(stderr, "Could not fetch interfaces (Reason: %s)\n", error);
+        return 1;
+    }
+
+    auto device = pcap_open_live(NULL, BUFSIZ, 0, -1, error);
+    if(device == NULL)
+    {
+        fprintf(stderr, "Could not open 'any' interface (Reason: %s)\n", error);
+        return 1;
+    }
+
+    bpf_u_int32 netmask;
 
     struct bpf_program filter;
-    bpf_u_int32 ip;
+    if(pcap_compile(device, &filter, "icmp[icmptype] = 8", 0, netmask) == PCAP_ERROR)
+    {
+        fprintf(stderr, "Failed to compile pcap filter (Reason: %s)\n", pcap_geterr(device));
+        return 1;
+    }
 
-    pcap_compile(device, &filter, "icmp[icmptype] = 8", 0, ip);
-    pcap_setfilter(device, &filter);
+    if(pcap_setfilter(device, &filter) == PCAP_ERROR)
+    {
+        fprintf(stderr, "Failed to set filter (Reason: %s)\n", pcap_geterr(device));
+        return 1;
+    }
 
-    pcap_loop(device, 20, packet_received, NULL);
+    pcap_loop(device, -1, packet_received, NULL);
     return 0;
 }
 
@@ -318,6 +408,8 @@ int main(int argc, char **argv)
 
     char * hostname = nullptr;
     char * filename = nullptr;
+    
+    // Whether the app should run in client on server mode
     bool listener = false;
 
     for(int i = 0; i < argc; i++)
@@ -332,15 +424,33 @@ int main(int argc, char **argv)
 
     if((hostname == nullptr || filename == nullptr) && !listener)
     {
-        printf("Both hostname and file must be provided in client mode\n");
+        fprintf(stderr, "Both hostname and file must be provided in client mode\n");
         return 1;
     }
 
+    // Server mode
     if(listener)
         return server();
+    // Client mode
     else
     {
-        auto address = inet_addr(hostname);
-        return client(address, filename);
+        struct addrinfo hints;
+        struct addrinfo *info;
+
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_RAW;
+
+        if(getaddrinfo(hostname, NULL, &hints, &info) != 0)
+        {
+            fprintf(stderr, "Could not resolve hostname\n");
+            return 1;
+        }
+
+        auto result = client(info, filename);
+
+        freeaddrinfo(info);
+
+        return result;
     }
 }
