@@ -30,8 +30,11 @@ struct secret_header
     int transfer_id;
 };
 
+// Maximum size of whole packet can be 1500 bytes
+const size_t MAX_TRANSFER_DATA = ((1500 - sizeof(struct sll_header) - sizeof(struct ip6_hdr) - sizeof(struct secret_header)) / AES_BLOCK_SIZE) * AES_BLOCK_SIZE;
+
 // Maximum size of secret_file_packet can be 1000 bytes
-const size_t MAX_FILENAME_LENGTH = 1000 - sizeof(secret_header) - sizeof(int);
+const size_t MAX_FILENAME_LENGTH = MAX_TRANSFER_DATA - sizeof(int);
 
 // Packet that is sent on new file transfer
 struct secret_file_packet
@@ -45,9 +48,6 @@ struct secret_file_packet
     // Name of the file that will be transferred
     char transfer_name[MAX_FILENAME_LENGTH];
 };
-
-// Maximum size of secret_data_packet can be 1000 bytes
-const size_t MAX_TRANSFER_DATA = ((1000 - sizeof(secret_header)) / AES_BLOCK_SIZE) * 16;
 
 // Maximum number of AES blocks that fit the ethernet packet
 const size_t MAX_AES_BLOCKS = MAX_TRANSFER_DATA / AES_BLOCK_SIZE;
@@ -125,7 +125,7 @@ int send_data(int socket, unsigned char *data, int transfer_id, addrinfo *addres
     return 1;
 }
 
-int client(addrinfo *address, char *filename)
+int client(addrinfo *address, char *filepath)
 {
     // Initialize either IPv4 or IPv6 socket
     int sockfd;
@@ -153,13 +153,22 @@ int client(addrinfo *address, char *filename)
         return 1;
     }
 
-    FILE *file = fopen(filename, "rb");
+    FILE *file = fopen(filepath, "rb");
 
     if(file == NULL)
     {
         fprintf(stderr, "Failed to open target file\n");
         return 1;
     }
+
+    // Extract file name from path
+    auto filename = basename(filepath);
+    if(strlen(filename) > MAX_FILENAME_LENGTH)
+    {
+        fprintf(stdout, "Maximum size of filename can be %zu\n", MAX_FILENAME_LENGTH);
+        fclose(file);
+        return 1;
+    } 
 
     // Calculate file length
     fseek(file, 0L, SEEK_END);
@@ -311,8 +320,7 @@ void packet_received(u_char *args, const struct pcap_pkthdr* header, const u_cha
     {
         auto fileHeader = (struct secret_file_packet*) secretHeader;
 
-        auto filename = basename(fileHeader->transfer_name);
-        auto file = fopen(filename, "wb+");
+        auto file = fopen(fileHeader->transfer_name, "wb+");
 
         if(file == NULL)
         {
@@ -327,7 +335,7 @@ void packet_received(u_char *args, const struct pcap_pkthdr* header, const u_cha
 
         transfers[secretHeader->transfer_id] = info;
 
-        printf("(TID: %d) Started receiving file: %s, size: %d bytes\n", secretHeader->transfer_id, filename, fileHeader->transfer_size);
+        printf("(TID: %d) Started receiving file: %s, size: %d bytes\n", secretHeader->transfer_id, fileHeader->transfer_name, fileHeader->transfer_size);
     }
     // Data for open file transfer
     else if(secretHeader->protocol_type == 2)
@@ -349,7 +357,7 @@ void packet_received(u_char *args, const struct pcap_pkthdr* header, const u_cha
             AES_set_decrypt_key(aes_key, 128, &key);
             AES_decrypt(&dataHeader->transfer_data[parsed_blocks * AES_BLOCK_SIZE], block, &key);
 
-            if(transfer->transfered + 16 >= transfer->transfer_size)
+            if(transfer->transfered + AES_BLOCK_SIZE >= transfer->transfer_size)
             {
                 printf("(TID: %d) File received successfully\n", secretHeader->transfer_id);
                 fwrite(block, 1, transfer->transfer_size - transfer->transfered, transfer->file);
@@ -410,7 +418,7 @@ int main(int argc, char **argv)
     srand(time(0));
 
     char * hostname = nullptr;
-    char * filename = nullptr;
+    char * filepath = nullptr;
     
     // Whether the app should run in client on server mode
     bool listener = false;
@@ -420,12 +428,12 @@ int main(int argc, char **argv)
         if(!strcmp(argv[i], "-s") && i < argc) // hostname
             hostname = argv[i + 1];
         else if(!strcmp(argv[i], "-r") && i < argc) // file
-            filename = argv[i + 1];
+            filepath = argv[i + 1];
         else if(!strcmp(argv[i], "-l")) // listener
             listener = true;
     }
 
-    if((hostname == nullptr || filename == nullptr) && !listener)
+    if((hostname == nullptr || filepath == nullptr) && !listener)
     {
         fprintf(stderr, "Both hostname and file must be provided in client mode\n");
         return 1;
@@ -450,7 +458,7 @@ int main(int argc, char **argv)
             return 1;
         }
 
-        auto result = client(info, filename);
+        auto result = client(info, filepath);
 
         freeaddrinfo(info);
 
