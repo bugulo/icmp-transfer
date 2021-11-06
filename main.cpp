@@ -272,17 +272,23 @@ int client(addrinfo *address, char *filepath)
     return 0;
 }
 
+// Transfer related information
 struct transfer_info
 {
+    // Size of the file
     int transfer_size;
 
+    // Number of bytes that were already received
     int transfered;
 
+    // Time of the last received packet
     int lastUpdate;
 
+    // File descriptor
     FILE *file;
 };
 
+// Map of all active transfers
 std::map<int, transfer_info*> transfers;
 
 void packet_received(u_char *args, const struct pcap_pkthdr* header, const u_char* packet)
