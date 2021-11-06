@@ -5,8 +5,11 @@
 #include <netdb.h>
 #include <stdio.h>
 #include <string.h>
+#include <pcap/sll.h>
 #include <sys/socket.h>
 #include <openssl/aes.h>
+#include <netinet/ip6.h>
+#include <netinet/icmp6.h>
 #include <netinet/ip_icmp.h>
 #include <netinet/if_ether.h>
 
@@ -94,7 +97,7 @@ int send_data(int socket, unsigned char *data, int transfer_id, addrinfo *addres
 {
     struct secret_data_packet data_packet;
     memset(&data_packet, 0, sizeof(data_packet));
-    data_packet.header.icmphdr.type = ICMP_ECHO;
+    data_packet.header.icmphdr.type = address->ai_family == AF_INET ? ICMP_ECHO : ICMP6_ECHO_REQUEST;
     data_packet.header.icmphdr.un.echo.id = rand();
     data_packet.header.icmphdr.un.echo.sequence = sequence++;
 
@@ -168,7 +171,7 @@ int client(addrinfo *address, char *filename)
 
     struct secret_file_packet file_packet;
     memset(&file_packet, 0, sizeof(file_packet));
-    file_packet.header.icmphdr.type = ICMP_ECHO;
+    file_packet.header.icmphdr.type = address->ai_family == AF_INET ? ICMP_ECHO : ICMP6_ECHO_REQUEST;
     file_packet.header.icmphdr.un.echo.id = rand();
     file_packet.header.icmphdr.un.echo.sequence = sequence++;
     
@@ -276,7 +279,7 @@ std::map<int, transfer_info*> transfers;
 void packet_received(u_char *args, const struct pcap_pkthdr* header, const u_char* packet)
 {
     auto currentTime = time(NULL);
-    
+
     // Remove inactive transfers from memory
     for (auto it = transfers.cbegin(), next_it = it; it != transfers.cend(); it = next_it)
     {
@@ -291,12 +294,13 @@ void packet_received(u_char *args, const struct pcap_pkthdr* header, const u_cha
         }
     }
 
-    auto ipHeader = (struct ip*) (packet + 16);
+    auto protocol = ntohs(((struct sll_header*) packet)->sll_protocol);
 
-    if (ipHeader->ip_p != IPPROTO_ICMP)
-        return;
-
-    auto secretHeader = (struct secret_header*) (packet + 16 + sizeof(struct ip));
+    struct secret_header* secretHeader;
+    if(protocol == ETHERTYPE_IP)
+        secretHeader = (struct secret_header*) (packet + sizeof(struct sll_header) + sizeof(struct ip));
+    else if(protocol == ETHERTYPE_IPV6)
+        secretHeader = (struct secret_header*) (packet + sizeof(struct sll_header) + sizeof(struct ip6_hdr));
 
     // Compare protocol hash so we can filter out other ICMP messages not relevant to our app
     if(strcmp(secretHeader->protocol_hash, PROTOCOL_HASH))
@@ -305,7 +309,7 @@ void packet_received(u_char *args, const struct pcap_pkthdr* header, const u_cha
     // Request for new file transfer
     if(secretHeader->protocol_type == 1)
     {
-        auto fileHeader = (struct secret_file_packet*) (packet + 16 + sizeof(struct ip));
+        auto fileHeader = (struct secret_file_packet*) secretHeader;
 
         auto filename = basename(fileHeader->transfer_name);
         auto file = fopen(filename, "wb+");
@@ -328,7 +332,7 @@ void packet_received(u_char *args, const struct pcap_pkthdr* header, const u_cha
     // Data for open file transfer
     else if(secretHeader->protocol_type == 2)
     {
-        auto dataHeader = (struct secret_data_packet*) (packet + 16 + sizeof(struct ip));
+        auto dataHeader = (struct secret_data_packet*) secretHeader;
 
         // if specified transfer_id does not exist
         if(transfers.find(secretHeader->transfer_id) == transfers.end())
@@ -345,7 +349,7 @@ void packet_received(u_char *args, const struct pcap_pkthdr* header, const u_cha
             AES_set_decrypt_key(aes_key, 128, &key);
             AES_decrypt(&dataHeader->transfer_data[parsed_blocks * AES_BLOCK_SIZE], block, &key);
 
-            if(transfer->transfered + 16 > transfer->transfer_size)
+            if(transfer->transfered + 16 >= transfer->transfer_size)
             {
                 printf("(TID: %d) File received successfully\n", secretHeader->transfer_id);
                 fwrite(block, 1, transfer->transfer_size - transfer->transfered, transfer->file);
@@ -385,7 +389,7 @@ int server()
     bpf_u_int32 netmask;
 
     struct bpf_program filter;
-    if(pcap_compile(device, &filter, "icmp[icmptype] = 8", 0, netmask) == PCAP_ERROR)
+    if(pcap_compile(device, &filter, "icmp[icmptype] = icmp-echo or icmp6[icmp6type] = icmp6-echo", 0, netmask) == PCAP_ERROR)
     {
         fprintf(stderr, "Failed to compile pcap filter (Reason: %s)\n", pcap_geterr(device));
         return 1;
