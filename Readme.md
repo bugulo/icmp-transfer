@@ -7,9 +7,9 @@ This app is able to encrypt file using AES and send it through ICMP echo request
 `-l` - Listener mode
 
 ## Build
-`make clean` - Clean files generated during build process\
-`make build` - Build project\
-`make` - Run clean & build in respective order
+`make clean` - Clean files generated during build process.\
+`make secret` - Build project.\
+`make` - Run secret target.
 
 ## Run
 ```
@@ -23,6 +23,7 @@ sudo ./secret -r some.file -s ::1
 ```
 Makefile
 README.md
+secret.1
 manual.pdf
 main.cpp
 ```
