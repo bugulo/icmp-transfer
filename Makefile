@@ -1,7 +1,9 @@
-all: clean build
+.PHONY: all clean
 
-build:
-	g++ main.cpp -lcrypto -lpcap -o secret
+all: secret
+
+secret:
+	$(CXX) main.cpp -lcrypto -lpcap -o $@
 
 clean: 
 	$(RM) secret

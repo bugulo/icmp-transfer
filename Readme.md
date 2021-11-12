@@ -15,7 +15,8 @@ This app is able to encrypt file using AES and send it through ICMP echo request
 ```
 make
 sudo ./secret -l
-sudo ./secret -r some.file -s 8.8.8.8
+sudo ./secret -r some.file -s localhost
+sudo ./secret -r some.file -s ::1
 ```
 
 ## Files
@@ -27,5 +28,5 @@ main.cpp
 ```
 
 ## Improvements
-
-## Limitations
+- Transfer status in output
+- Simultaneous active transfers on server
