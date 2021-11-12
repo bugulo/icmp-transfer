@@ -1,3 +1,9 @@
+/*
+ *  ISA - Project: secret
+ *  Michal Šlesár
+ *  xslesa01
+ */
+
 #include <map>
 #include <string>
 
