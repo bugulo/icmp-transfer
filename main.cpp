@@ -392,13 +392,6 @@ int server()
 {
     char error[PCAP_ERRBUF_SIZE];
 
-    pcap_if_t *interfaces;
-    if(pcap_findalldevs(&interfaces, error) == PCAP_ERROR)
-    {
-        fprintf(stderr, "Could not fetch interfaces (Reason: %s)\n", error);
-        return 1;
-    }
-
     auto device = pcap_open_live(NULL, BUFSIZ, 0, -1, error);
     if(device == NULL)
     {
