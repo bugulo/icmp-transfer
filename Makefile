@@ -3,7 +3,7 @@
 all: secret
 
 secret:
-	$(CXX) main.cpp -lcrypto -lpcap -pedantic -Wall -Wextra -o $@
+	$(CXX) main.cpp -lcrypto -lssl -lpcap -pedantic -Wall -Wextra -o $@
 
 clean: 
 	$(RM) secret
