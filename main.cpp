@@ -8,6 +8,7 @@
 #include <string>
 
 #include <pcap.h>
+#include <poll.h>
 #include <netdb.h>
 #include <stdio.h>
 #include <string.h>
@@ -99,7 +100,17 @@ static const unsigned char aes_key[] = {
 // Sent packets counter
 auto sequence = 0;
 
-int send_data(int socket, unsigned char *data, int transfer_id, addrinfo *address)
+/**
+ * @brief Send data to socket with address
+ *
+ * @param socket Socket file descriptor
+ * @param pdf Poll related structure
+ * @param data Data to send
+ * @param transfer_id Transfer ID
+ * @param address Target server address
+ * @return 1 on error, 0 otherwise
+ */
+int send_data(int socket, pollfd *pfd, unsigned char *data, int transfer_id, addrinfo *address)
 {
     struct secret_data_packet data_packet;
     memset(&data_packet, 0, sizeof(data_packet));
@@ -116,6 +127,7 @@ int send_data(int socket, unsigned char *data, int transfer_id, addrinfo *addres
 
     data_packet.header.icmphdr.checksum = checksum(&data_packet, sizeof(data_packet));
 
+    poll(pfd, 1, INACTIVITY_TIMEOUT);
     auto sent = sendto(socket, &data_packet, sizeof(data_packet), 0, address->ai_addr, address->ai_addrlen);
 
     if(sent < 0)
@@ -131,6 +143,13 @@ int send_data(int socket, unsigned char *data, int transfer_id, addrinfo *addres
     return 1;
 }
 
+/**
+ * @brief Client implementation
+ *
+ * @param address Target address
+ * @param filepath File that will be sent
+ * @return 1 on error, 0 otherwise
+ */
 int client(addrinfo *address, char *filepath)
 {
     // Initialize either IPv4 or IPv6 socket
@@ -145,6 +164,11 @@ int client(addrinfo *address, char *filepath)
         fprintf(stderr, "Failed to create socket\n");
         return 1;
     }
+
+    // Prepare poll structure
+    struct pollfd pfd;
+    pfd.fd = sockfd;
+    pfd.events = POLLOUT;
 
     // Set timeout options
     struct timeval tv_out;
@@ -203,6 +227,7 @@ int client(addrinfo *address, char *filepath)
 
     fprintf(stdout, "Sending file to the server... (Tranfer ID: %d)\n", transferId);
 
+    poll(&pfd, 1, INACTIVITY_TIMEOUT);
     auto sent = sendto(sockfd, &file_packet, sizeof(file_packet), 0, address->ai_addr, address->ai_addrlen);
 
     if(sent < 0)
@@ -248,7 +273,7 @@ int client(addrinfo *address, char *filepath)
         
         if(bytes_read < AES_BLOCK_SIZE)
         {
-            if(!send_data(sockfd, packetData, transferId, address))
+            if(!send_data(sockfd, &pfd, packetData, transferId, address))
             {
                 fprintf(stdout, "\nFailed to send block of data, exiting\n");
                 fclose(file);
@@ -259,7 +284,7 @@ int client(addrinfo *address, char *filepath)
 
         if(parsed_blocks == MAX_AES_BLOCKS)
         {
-            if(!send_data(sockfd, packetData, transferId, address))
+            if(!send_data(sockfd, &pfd, packetData, transferId, address))
             {
                 fprintf(stdout, "\nFailed to send block of data, exiting\n");
                 fclose(file);
@@ -297,6 +322,9 @@ struct transfer_info
 // Map of all active transfers
 std::map<int, transfer_info*> transfers;
 
+/**
+ * @brief Packet handler callback
+ */
 void packet_received(u_char *args, const struct pcap_pkthdr* header, const u_char* packet)
 {
     auto currentTime = time(NULL);
@@ -388,6 +416,11 @@ void packet_received(u_char *args, const struct pcap_pkthdr* header, const u_cha
     }
 }
 
+/**
+ * @brief Server implementation
+ * 
+ * @return 1 on error, 0 otherwise
+ */
 int server()
 {
     char error[PCAP_ERRBUF_SIZE];
