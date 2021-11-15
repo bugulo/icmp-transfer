@@ -122,7 +122,7 @@ int send_data(int socket, pollfd *pfd, unsigned char *data, int transfer_id, add
     data_packet.header.protocol_type = 2;
     data_packet.header.transfer_id = transfer_id;
 
-    for(int i = 0; i < MAX_TRANSFER_DATA; i++)
+    for(size_t i = 0; i < MAX_TRANSFER_DATA; i++)
         data_packet.transfer_data[i] = data[i];
 
     data_packet.header.icmphdr.checksum = checksum(&data_packet, sizeof(data_packet));
@@ -220,7 +220,7 @@ int client(addrinfo *address, char *filepath)
 
     file_packet.transfer_size = size;
     
-    for(auto i = 0; i < strlen(filename); i++)
+    for(size_t i = 0; i < strlen(filename); i++)
         file_packet.transfer_name[i] = filename[i];
 
     file_packet.header.icmphdr.checksum = checksum(&file_packet, sizeof(file_packet));
@@ -325,7 +325,7 @@ std::map<int, transfer_info*> transfers;
 /**
  * @brief Packet handler callback
  */
-void packet_received(u_char *args, const struct pcap_pkthdr* header, const u_char* packet)
+void packet_received(u_char */*args*/, const struct pcap_pkthdr */* header */, const u_char* packet)
 {
     auto currentTime = time(NULL);
 
@@ -432,10 +432,8 @@ int server()
         return 1;
     }
 
-    bpf_u_int32 netmask;
-
     struct bpf_program filter;
-    if(pcap_compile(device, &filter, "icmp[icmptype] = icmp-echo or icmp6[icmp6type] = icmp6-echo", 0, netmask) == PCAP_ERROR)
+    if(pcap_compile(device, &filter, "icmp[icmptype] = icmp-echo or icmp6[icmp6type] = icmp6-echo", 0, PCAP_NETMASK_UNKNOWN) == PCAP_ERROR)
     {
         fprintf(stderr, "Failed to compile pcap filter (Reason: %s)\n", pcap_geterr(device));
         return 1;
